@@ -32,6 +32,21 @@ from .statistics import (
     use_percentiles,
     use_stats,
 )
+from .two_compartment_fit import (
+    AllenSweepBatch,
+    choose_current_clamp_sweeps,
+    detect_spikes_from_voltage,
+    exponential_filter_spike_train,
+    filter_mouse_visp_l5_pyramidal_cells,
+    fit_two_compartment_model,
+    get_cell_types_cache,
+    load_allen_sweep,
+    mask_post_spike_voltage_samples,
+    query_mouse_visp_l5_pyramidal_cells,
+    resample_trace,
+    rollout_two_compartment,
+    two_compartment_loss,
+)
 from .voltage import suggest_skip_timestep, voltage_overshoot
 
 
@@ -68,6 +83,19 @@ __all__ = [
     "compute_log_hist",
     "compute_spectrum",
     "describe_array",
+    "AllenSweepBatch",
+    "choose_current_clamp_sweeps",
+    "detect_spikes_from_voltage",
+    "exponential_filter_spike_train",
+    "filter_mouse_visp_l5_pyramidal_cells",
+    "fit_two_compartment_model",
+    "get_cell_types_cache",
+    "load_allen_sweep",
+    "mask_post_spike_voltage_samples",
+    "query_mouse_visp_l5_pyramidal_cells",
+    "resample_trace",
+    "rollout_two_compartment",
+    "two_compartment_loss",
     "suggest_skip_timestep",
     "voltage_overshoot",
     "StatChoice",

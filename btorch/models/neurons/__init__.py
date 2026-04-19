@@ -2,6 +2,7 @@ from .alif import ALIF, ELIF
 from .glif import GLIF3
 from .izhikevich import Izhikevich
 from .lif import LIF
+from .two_compartment import TwoCompartmentGLIF
 
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "ELIF",
     "GLIF3",
     "Izhikevich",
+    "TwoCompartmentGLIF",
 ]
