@@ -1,134 +1,137 @@
 # Two-Compartment Fitting Report
 
-## Status
+## Current Status
 
-The two-compartment neuron model and the Allen fitting pipeline have been
-implemented on branch `few-compartment-model`, but the neuronal parameters have
-not been fitted to real Allen Brain Institute data yet.
+Real Allen-data fitting has now been executed in this repository.
 
-In other words:
+The project has moved through three phases:
 
-- The code to fit parameters exists.
-- The real AllenSDK download / preprocessing / optimization run has not been
-  executed yet in this repository.
-- No fitted parameter values or fitted checkpoints have been produced so far.
+1. Infrastructure only
+2. Real-data fitting on weak single-spike long-square sweeps
+3. Real-data fitting on sustained-spiking long-square sweeps with a minimal
+   spike-initiation model extension
 
-## What Was Implemented
+The current best result is not perfect, but it is the first run that gets the
+held-out spike count close while also recovering a meaningful fraction of spike
+timing on a genuine sustained-spiking VISp L5 pyramidal specimen.
 
-### 1. Two-compartment neuron module
+## Important Commits
 
-Implemented in:
+- `579d54c`: adaptive-threshold checkpoint
+- `90e724c`: spike-initiation fitting strategy checkpoint
 
-- [btorch/models/neurons/two_compartment.py](./btorch/models/neurons/two_compartment.py)
+The current working tree after `90e724c` keeps the spike-initiation direction
+and updates the reports below.
 
-This module includes:
+## Best Current Real Run
 
-- somatic voltage state `v`
-- apical slow current state `i_a`
-- delayed back-propagating current state `i_bap`
-- trainable parameters:
-  - `tau_s`
-  - `R_s`
-  - `E_L`
-  - `tau_a`
-  - `w_Ca`
-  - `theta_Ca`
-  - `w_sa`
-  - `w_as`
-- surrogate-gradient somatic spiking
-- single-step and multi-step rollout
-- `btorch`-compatible memory registration and reset behavior
+Best artifact folder:
 
-### 2. Allen fitting pipeline
+- [artifacts/two_compartment_fit_sustained_selection_v5_spikeinit](./artifacts/two_compartment_fit_sustained_selection_v5_spikeinit)
 
-Implemented in:
+Selected specimen:
 
-- [btorch/analysis/two_compartment_fit.py](./btorch/analysis/two_compartment_fit.py)
+- `566506157`
 
-This pipeline includes:
+Train sweeps:
 
-- AllenSDK-backed cell query helpers
-- mouse VISp layer-5 pyramidal candidate filtering
-- current-clamp sweep selection helpers
-- Allen sweep loading and resampling
-- spike extraction from voltage traces
-- masked voltage loss
-- smoothed spike-train loss
-- `w_Ca` sparsity regularization
-- a bounded global-search fitting path for poor initializations
-- optional local polish and TBPTT refinement
-- the original truncated BPTT training loop using:
-  - `functional.reset_net`
-  - `functional.detach_net`
+- `52`, `64`, `53`
 
-### 3. Example entrypoint
+Test sweep:
 
-Implemented in:
+- `51`
 
-- [examples/allen_two_compartment_fit.py](./examples/allen_two_compartment_fit.py)
+These sweeps are qualitatively much better than the earlier weak specimen
+because they contain sustained firing over the long-square pulse:
 
-This is a runnable example script for:
+- sweep `52`: `18` spikes over about `952 ms`
+- sweep `64`: `11` spikes over about `904 ms`
+- sweep `51` (test): `17` spikes over about `922.5 ms`
 
-- querying candidate Allen cells
-- selecting sweeps
-- loading them into tensors
-- fitting the model with the implemented training loop
+## Best Held-Out Metrics So Far
 
-### 4. Tests
+From:
 
-Implemented in:
+- [artifacts/two_compartment_fit_sustained_selection_v5_spikeinit/test/fit_metrics.json](./artifacts/two_compartment_fit_sustained_selection_v5_spikeinit/test/fit_metrics.json)
 
-- [tests/models/neurons/test_two_compartment.py](./tests/models/neurons/test_two_compartment.py)
+Held-out spiking sweep metrics:
 
-Verified locally:
+- `spike_count_true = 17`
+- `spike_count_pred = 15`
+- `spike_count_error = 2`
+- `spike_timing_f1 = 0.75`
+- `precision = 0.80`
+- `recall = 0.7059`
+- `matched_spikes = 12`
+- `false_positive_spikes = 3`
+- `false_negative_spikes = 5`
+- `voltage_rmse = 6.07 mV`
+- `voltage_r2 = 0.529`
 
-- targeted pytest passed
-- compileall checks passed
-- synthetic rollout / synthetic fitting smoke tests passed
+Test plot:
 
-## What Has NOT Been Done Yet
+- [fit_specimen_566506157_sweep_51_0.png](./artifacts/two_compartment_fit_sustained_selection_v5_spikeinit/test/fit_specimen_566506157_sweep_51_0.png)
 
-The following has not been completed yet:
+## Interpretation
 
-- installing `allensdk` in the active environment
-- downloading real Allen electrophysiology sweeps
-- running the training script on real Allen data
-- saving fitted parameters or checkpoints
-- evaluating fit quality on held-out sweeps
-- documenting final fitted values
+This is the first result that clearly enters the correct firing regime on a
+held-out sustained-spiking sweep.
 
-## Direct Answer
+What improved:
 
-No, the neuronal parameters are not fitted yet.
+- the model no longer collapses to `0` spikes
+- spike count is close on held-out data
+- spike timing overlap is substantial
 
-What exists now is the fitting infrastructure, not the final fitted model.
+What is still weak:
 
-## Next Step To Produce Fitted Parameters
+- voltage fit degraded relative to the earlier non-spiking solutions
+- the model still misses some spikes and adds a few extras
+- training performance is less clean than the single held-out test result
 
-1. Install AllenSDK in the active environment:
+So the current best model is better judged as:
 
-```bash
-micromamba run -n btorch pip install allensdk
-```
+- good direction for spike count and timing
+- not yet a fully satisfactory joint spike-plus-voltage fit
 
-2. Run the example fitting script:
+## Model Changes That Mattered
 
-```bash
-micromamba run -n btorch python examples/allen_two_compartment_fit.py --method hybrid --max-cells 1 --max-sweeps-per-cell 1 --epochs 5 --chunk-size 500 --dt-ms 0.5
-```
+The most important effective change was not just optimizer tuning.
 
-3. Inspect the learned parameters after training, for example:
+The current best direction combined:
 
-```python
-for name, param in model.named_parameters():
-    print(name, param.detach().cpu())
-```
+- better Allen sweep selection across multiple candidate cells
+- rejection of onset-only sweeps when sustained-spiking sweeps are available
+- a staged fitter that calibrates spike initiation explicitly
+- a minimal exponential spike-initiation term in the somatic voltage update
 
-## Recommended Follow-up
+The earlier adaptive-threshold-only variant did not solve the sustained-firing
+problem by itself.
 
-- run a first real Allen fitting pass
-- save the trained state dict and learned parameters
-- add a report comparing predicted vs recorded voltage and spike timing
-- refine sweep filtering and unit normalization if the first fit is unstable
-- use the hybrid method by default when the initial parameter guess is far from
-  the biological regime
+## Experiments Tried After The Best Run
+
+Two follow-up ideas were tested after the best `v5_spikeinit` run:
+
+1. voltage-focused extra staged refinement
+2. TBPTT polish from the best spike-initiation solution
+
+Neither produced a better overall tradeoff than `v5_spikeinit`, so that run is
+still the recommended checkpoint to build from.
+
+## Files To Inspect
+
+- Model: [btorch/models/neurons/two_compartment.py](./btorch/models/neurons/two_compartment.py)
+- Fitter: [btorch/analysis/two_compartment_fit.py](./btorch/analysis/two_compartment_fit.py)
+- Example: [examples/allen_two_compartment_fit.py](./examples/allen_two_compartment_fit.py)
+- Tests: [tests/models/neurons/test_two_compartment.py](./tests/models/neurons/test_two_compartment.py)
+
+## Recommended Next Step
+
+Keep the spike-initiation extension and improve voltage fit without losing the
+held-out spike gains from `v5_spikeinit`.
+
+The safest next work items are:
+
+- tune the later fitting stages rather than reverting the model
+- add a constrained voltage-polish pass only if spike-count error stays low
+- compare multiple sustained-spiking specimens, not just one

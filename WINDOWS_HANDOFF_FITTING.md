@@ -1,189 +1,111 @@
 # Windows Handoff For Two-Compartment Fitting
 
-## Purpose
+## Current Best Checkpoints
 
-This note explains how to continue the two-compartment neuron fitting workflow
-on a Windows machine.
+Repository branch:
 
-The current macOS work has been stopped intentionally, and the temporary
-environment `btorch-fit-py311` has been deleted.
-
-## Current Repository Status
-
-The code changes that were added locally are still present in this repository.
-
-New or modified files relevant to the fitting workflow:
-
-- `btorch/models/neurons/two_compartment.py`
-- `btorch/models/neurons/__init__.py`
-- `btorch/models/__init__.py`
-- `btorch/analysis/two_compartment_fit.py`
-- `btorch/analysis/__init__.py`
-- `examples/allen_two_compartment_fit.py`
-- `tests/models/neurons/test_two_compartment.py`
-- `TWO_COMPARTMENT_FIT_REPORT.md`
-
-Branch:
-5
 - `few-compartment-model`
 
-## Important Status Clarification
+Important commits:
 
-The fitting pipeline has been implemented, but real Allen-data fitting has not
-been completed yet.
+- `579d54c`: adaptive-threshold checkpoint
+- `90e724c`: spike-initiation fitting strategy checkpoint
 
-That means:
+The best fitting result so far is based on the spike-initiation direction, not
+the earlier adaptive-threshold-only checkpoint.
 
-- the model code exists
-- the Allen preprocessing and fitting utilities exist
-- the example script exists
-- no final fitted biological parameters have been produced yet
+## Current Best Artifact
 
-## Recommended Windows Setup
+Best run folder:
+
+- [artifacts/two_compartment_fit_sustained_selection_v5_spikeinit](./artifacts/two_compartment_fit_sustained_selection_v5_spikeinit)
+
+Best held-out result:
+
+- specimen `566506157`
+- test sweep `51`
+- true spikes `17`
+- predicted spikes `15`
+- spike count error `2`
+- spike timing F1 `0.75`
+- precision `0.80`
+- recall `0.7059`
+- voltage RMSE `6.07 mV`
+- voltage R2 `0.529`
+
+Best held-out plot:
+
+- [fit_specimen_566506157_sweep_51_0.png](./artifacts/two_compartment_fit_sustained_selection_v5_spikeinit/test/fit_specimen_566506157_sweep_51_0.png)
+
+## What Actually Changed
+
+The current fitting workflow is no longer just “fit the first VISp L5 cell”.
+
+It now:
+
+- queries multiple mouse VISp L5 pyramidal candidates
+- ranks them by sustained-spiking richness
+- rejects onset-only long-square sweeps when better sustained sweeps exist
+- fits a minimally extended two-compartment model with an exponential
+  spike-initiation term
+- uses staged bounded fitting to get into the right firing regime
+
+## Environment
 
 Use Python 3.11 on Windows for AllenSDK compatibility.
 
-Recommended environment name:
+Recommended environment:
 
 - `btorch-fit-py311`
 
-Recommended tools:
-
-- `micromamba` or `conda`
-- Git
-
-## Step 1: Move The Repository
-
-On the Windows machine, get the repository with your current changes by using
-one of these approaches:
-
-### Option A: push branch and pull on Windows
-
-From the current machine:
-
-```bash
-git add .
-git commit -m "Add two-compartment neuron and Allen fitting pipeline"
-git push origin few-compartment-model
-```
-
-Then on Windows:
-
-```bash
-git clone <your-repo-url>
-cd btorch
-git checkout few-compartment-model
-```
-
-### Option B: copy the working tree directly
-
-Copy the full repository folder to Windows, including the `.git` directory if
-you want to preserve branch history locally.
-
-## Step 2: Create The Windows Environment
-
-### Micromamba
+Create it with micromamba:
 
 ```powershell
 micromamba create -y -n btorch-fit-py311 -c conda-forge python=3.11 pip
 ```
 
-### Conda
+Install dependencies:
 
 ```powershell
-conda create -y -n btorch-fit-py311 python=3.11 pip
-```
-
-## Step 3: Install Runtime Dependencies
-
-Install the minimum fitting stack first:
-
-```powershell
-micromamba run -n btorch-fit-py311 pip install allensdk torch torchvision jaxtyping spikingjelly pytest
-```
-
-Then install the repository itself:
-
-```powershell
+micromamba run -n btorch-fit-py311 pip install allensdk torch torchvision jaxtyping spikingjelly pytest ruff
 micromamba run -n btorch-fit-py311 pip install -e . --config-settings editable_mode=strict
 ```
 
-If you prefer conda instead of micromamba, replace `micromamba run -n ...` with
-`conda run -n ...`.
-
-## Step 4: Verify The Local Code
-
-Run the focused tests first:
+## Verify Before Running
 
 ```powershell
-micromamba run -n btorch-fit-py311 pytest tests/models/neurons/test_two_compartment.py -q
+micromamba run -n btorch-fit-py311 python -m ruff check btorch/models/neurons/two_compartment.py btorch/analysis/two_compartment_fit.py examples/allen_two_compartment_fit.py tests/models/neurons/test_two_compartment.py
+micromamba run -n btorch-fit-py311 python -m pytest tests/models/neurons/test_two_compartment.py -q
 ```
 
-Optionally syntax-check the example:
+## Reproduce The Best Current Run
 
 ```powershell
-micromamba run -n btorch-fit-py311 python -m compileall examples/allen_two_compartment_fit.py
+micromamba run -n btorch-fit-py311 python examples/allen_two_compartment_fit.py --method staged --max-cells 1 --candidate-cells 8 --max-sweeps-per-cell 4 --test-fraction 0.25 --dt-ms 0.5 --global-maxiter 1 --global-popsize 3 --local-maxiter 3 --tbptt-refine-epochs 0 --output-dir artifacts/two_compartment_fit_sustained_selection_v5_spikeinit
 ```
 
-## Step 5: Start The First Real Fit
+## What To Build From
 
-Run a small first-pass fit on one cell and one sweep:
+If continuing the work, build from:
 
-```powershell
-micromamba run -n btorch-fit-py311 python examples/allen_two_compartment_fit.py --method hybrid --max-cells 1 --max-sweeps-per-cell 1 --epochs 5 --chunk-size 500 --dt-ms 0.5
-```
+- commit `90e724c`
+- artifact folder `artifacts/two_compartment_fit_sustained_selection_v5_spikeinit`
 
-This is intentionally conservative so the first run is easier to debug.
-The hybrid method is the recommended default when the starting parameters are
-far from the real cell because the bounded global search is more robust than
-starting directly with BPTT.
+Not from the earlier weak-specimen runs, because those long-square sweeps were
+too close to onset-only firing and gave misleading conclusions.
 
-## Step 6: Inspect Learned Parameters
+## What We Learned
 
-After the first fit works, inspect the trained parameters by adding or running
-something like:
+- Data selection mattered a lot.
+- Adaptive threshold alone was not enough.
+- A minimal spike-initiation nonlinearity was the first change that broke the
+  zero-spike failure mode.
+- Later voltage-polish ideas were not yet clearly better than the current best
+  spike-initiation run.
 
-```python
-for name, param in model.named_parameters():
-    print(name, param.detach().cpu())
-```
+## Recommended Next Work
 
-You will likely also want to save:
-
-- fitted parameters
-- optimizer state
-- selected specimen id and sweep number
-- loss curves
-- predicted vs recorded traces
-
-## Recommended Next Improvements On Windows
-
-- save checkpoints during fitting
-- add plotting for `v_true` vs `v_pred`
-- add plotting for true vs predicted spike trains
-- tighten Allen sweep filtering
-- verify current and voltage unit conventions carefully
-- consider positivity constraints for `tau_s`, `tau_a`, and `R_s`
-- prefer hybrid global-search-first fitting over pure TBPTT for the initial fit
-
-## Known Caveat
-
-AllenSDK failed to install cleanly in the existing macOS Python 3.12 workflow
-because it pulled an older NumPy path incompatible with that setup.
-
-That is the reason Windows continuation should use Python 3.11.
-
-## Short Summary
-
-What is done:
-
-- model implementation
-- fitting pipeline implementation
-- example script
-- focused tests
-
-What is not done:
-
-- real Allen-data fitting results
-- final fitted parameter report
-- checkpointed trained model
+- preserve the spike-initiation extension
+- improve voltage fit without losing the held-out spike gains
+- compare across a few more sustained-spiking specimens instead of relying on
+  one cell only
