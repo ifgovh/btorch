@@ -31,7 +31,8 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
 
     .. math::
         \\tau_s \\frac{dV_s}{dt} =
-        -(V_s - E_L) + R_s \\left(I_{soma} + w_{as} I_a\\right)
+        -(V_s - E_L) + R_s \\left(I_{soma} + w_{as} I_a\\right) +
+        \\Delta_T \\exp\\left(\\frac{V_s - V_{th,eff}}{\\Delta_T}\\right)
 
     .. math::
         \\tau_a \\frac{dI_a}{dt} =
@@ -62,6 +63,7 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         tau_a: Apical current time constant.
         tau_th: Adaptive-threshold decay time constant.
         delta_th: Post-spike threshold increment.
+        delta_T: Exponential spike-initiation scale. Set to zero to disable.
         w_Ca: Calcium plateau amplitude.
         theta_Ca: Apical plateau activation threshold.
         w_sa: Somatic-to-apical coupling weight for the delayed bAP current.
@@ -112,6 +114,7 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
     tau_a: torch.Tensor | torch.nn.Parameter
     tau_th: torch.Tensor | torch.nn.Parameter
     delta_th: torch.Tensor | torch.nn.Parameter
+    delta_T: torch.Tensor | torch.nn.Parameter
     w_Ca: torch.Tensor | torch.nn.Parameter
     theta_Ca: torch.Tensor | torch.nn.Parameter
     w_sa: torch.Tensor | torch.nn.Parameter
@@ -129,6 +132,7 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         tau_a: float | Float[TensorLike, " n_neuron"] = 100.0,
         tau_th: float | Float[TensorLike, " n_neuron"] = 50.0,
         delta_th: float | Float[TensorLike, " n_neuron"] = 0.0,
+        delta_T: float | Float[TensorLike, " n_neuron"] = 0.0,
         w_Ca: float | Float[TensorLike, " n_neuron"] = 0.0,
         theta_Ca: float | Float[TensorLike, " n_neuron"] = 1.0,
         w_sa: float | Float[TensorLike, " n_neuron"] = 0.5,
@@ -164,6 +168,7 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
             ("tau_a", tau_a),
             ("tau_th", tau_th),
             ("delta_th", delta_th),
+            ("delta_T", delta_T),
             ("w_Ca", w_Ca),
             ("theta_Ca", theta_Ca),
             ("w_sa", w_sa),
@@ -217,13 +222,24 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         self,
         i_soma: Float[Tensor, "*batch n_neuron"],
         i_a_next: Float[Tensor, "*batch n_neuron"],
+        threshold_eff: Float[Tensor, "*batch n_neuron"],
         dt: float,
     ) -> Float[Tensor, "*batch n_neuron"]:
         tau_s = self._positive(self.tau_s)
         R_s = self._positive(self.R_s)
         total_current = i_soma + self.w_as * i_a_next
+        delta_T = torch.clamp(self.delta_T, min=0.0)
+        exp_arg = torch.clamp(
+            (self.v - threshold_eff) / torch.clamp(delta_T, min=1e-4),
+            max=10.0,
+        )
+        exp_drive = torch.where(
+            delta_T > 0.0,
+            delta_T * torch.exp(exp_arg),
+            torch.zeros_like(self.v),
+        )
         decay = dt / tau_s
-        numerator = self.v + decay * (self.E_L + R_s * total_current)
+        numerator = self.v + decay * (self.E_L + R_s * total_current + exp_drive)
         return numerator / (1.0 + decay)
 
     def _reset_voltage(
@@ -272,8 +288,13 @@ class TwoCompartmentGLIF(ParamBufferMixin, MemoryModule):
         )
 
         i_a_next = self._update_apical_current(apical_drive, dt)
-        v_pre_spike = self._update_somatic_voltage(soma_drive, i_a_next, dt)
         threshold_eff = self.v_threshold + self.theta_th
+        v_pre_spike = self._update_somatic_voltage(
+            soma_drive,
+            i_a_next,
+            threshold_eff,
+            dt,
+        )
         spike = self.surrogate_function(v_pre_spike - threshold_eff)
 
         self.i_a = i_a_next

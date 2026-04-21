@@ -41,8 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-fraction", type=float, default=0.33)
     parser.add_argument("--dt-ms", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--tbptt-refine-epochs", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--tbptt-refine-lr", type=float, default=2e-4)
     parser.add_argument("--voltage-weight", type=float, default=1.0)
     parser.add_argument("--spike-weight", type=float, default=5.0)
     parser.add_argument("--spike-count-weight", type=float, default=20.0)
@@ -549,6 +551,7 @@ def main() -> None:
         tau_a=80.0,
         tau_th=50.0,
         delta_th=2.0,
+        delta_T=2.0,
         w_Ca=0.0,
         theta_Ca=3.0,
         w_sa=0.0,
@@ -562,6 +565,7 @@ def main() -> None:
             "tau_a",
             "tau_th",
             "delta_th",
+            "delta_T",
             "w_Ca",
             "theta_Ca",
             "w_sa",
@@ -591,6 +595,23 @@ def main() -> None:
         seed=args.seed,
         device=device,
     )
+    if args.tbptt_refine_epochs > 0:
+        tbptt_history = fit_two_compartment_model(
+            model,
+            train_sweeps,
+            method="tbptt",
+            lr=args.tbptt_refine_lr,
+            epochs=args.tbptt_refine_epochs,
+            chunk_size=args.chunk_size,
+            voltage_weight=max(args.voltage_weight, 2.0),
+            spike_weight=args.spike_weight,
+            spike_count_weight=max(args.spike_count_weight, 25.0),
+            spike_timing_weight=max(args.spike_timing_weight, 12.0),
+            spike_match_window_ms=args.spike_match_window_ms,
+            sparsity_weight=args.sparsity_weight,
+            device=device,
+        )
+        history.extend(tbptt_history)
     train_evaluations, train_aggregate = evaluate_fit_across_sweeps(
         model,
         train_sweeps,

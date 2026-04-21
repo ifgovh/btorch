@@ -94,6 +94,47 @@ def test_two_compartment_dynamic_threshold_accumulates_after_spike():
     assert float(spike_2.item()) == 0.0
 
 
+def test_two_compartment_exponential_initiation_boosts_pre_spike_voltage():
+    base = TwoCompartmentGLIF(
+        n_neuron=1,
+        tau_s=10.0,
+        R_s=0.2,
+        E_L=-70.0,
+        v_threshold=-50.0,
+        v_reset=-65.0,
+        delta_T=0.0,
+    )
+    boosted = TwoCompartmentGLIF(
+        n_neuron=1,
+        tau_s=10.0,
+        R_s=0.2,
+        E_L=-70.0,
+        v_threshold=-50.0,
+        v_reset=-65.0,
+        delta_T=3.0,
+    )
+    init_net_state(base, batch_size=1, dtype=torch.float32)
+    init_net_state(boosted, batch_size=1, dtype=torch.float32)
+    base.v = torch.full_like(base.v, -51.0)
+    boosted.v = torch.full_like(boosted.v, -51.0)
+
+    with environ.context(dt=1.0):
+        _, _, base_state = base.single_step_forward(
+            torch.full((1, 1), 10.0),
+            torch.zeros(1, 1),
+            return_state=True,
+        )
+        _, _, boosted_state = boosted.single_step_forward(
+            torch.full((1, 1), 10.0),
+            torch.zeros(1, 1),
+            return_state=True,
+        )
+
+    assert float(boosted_state["v_pre_spike"].item()) > float(
+        base_state["v_pre_spike"].item()
+    )
+
+
 def test_two_compartment_loss_masks_post_spike_samples_and_regularizes_w_ca():
     v_true = torch.tensor([0.0, 1.0, 10.0, 0.8, 0.2]).view(5, 1, 1)
     v_pred = torch.tensor([0.0, 1.2, -10.0, 0.6, 0.1]).view(5, 1, 1)
@@ -187,6 +228,7 @@ def test_global_fit_improves_tau_s_from_poor_initialization():
         tau_a=120.0,
         tau_th=50.0,
         delta_th=0.0,
+        delta_T=0.0,
         w_Ca=0.0,
         theta_Ca=2.0,
         w_sa=0.0,
@@ -209,6 +251,7 @@ def test_global_fit_improves_tau_s_from_poor_initialization():
         tau_a=120.0,
         tau_th=50.0,
         delta_th=0.0,
+        delta_T=0.0,
         w_Ca=0.0,
         theta_Ca=2.0,
         w_sa=0.0,
@@ -254,6 +297,7 @@ def test_staged_fit_runs_with_mixed_sweeps():
         tau_a=120.0,
         tau_th=50.0,
         delta_th=0.0,
+        delta_T=0.0,
         w_Ca=0.0,
         theta_Ca=3.0,
         w_sa=0.0,
@@ -285,6 +329,7 @@ def test_staged_fit_runs_with_mixed_sweeps():
         tau_a=120.0,
         tau_th=50.0,
         delta_th=0.0,
+        delta_T=2.0,
         w_Ca=0.0,
         theta_Ca=3.0,
         w_sa=0.0,
@@ -300,6 +345,7 @@ def test_staged_fit_runs_with_mixed_sweeps():
             "v_reset",
             "tau_th",
             "delta_th",
+            "delta_T",
         },
     )
     sweeps = [
@@ -346,6 +392,7 @@ def test_fit_evaluation_and_report_outputs(tmp_path):
         tau_a=120.0,
         tau_th=50.0,
         delta_th=0.0,
+        delta_T=0.0,
         w_Ca=0.0,
         theta_Ca=1.0,
         w_sa=0.0,
