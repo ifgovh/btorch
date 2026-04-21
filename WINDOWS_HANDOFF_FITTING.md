@@ -24,7 +24,7 @@ New or modified files relevant to the fitting workflow:
 - `TWO_COMPARTMENT_FIT_REPORT.md`
 
 Branch:
-
+5
 - `few-compartment-model`
 
 ## Important Status Clarification
@@ -130,10 +130,13 @@ micromamba run -n btorch-fit-py311 python -m compileall examples/allen_two_compa
 Run a small first-pass fit on one cell and one sweep:
 
 ```powershell
-micromamba run -n btorch-fit-py311 python examples/allen_two_compartment_fit.py --max-cells 1 --max-sweeps-per-cell 1 --epochs 5 --chunk-size 500 --dt-ms 0.5
+micromamba run -n btorch-fit-py311 python examples/allen_two_compartment_fit.py --method hybrid --max-cells 1 --max-sweeps-per-cell 1 --epochs 5 --chunk-size 500 --dt-ms 0.5
 ```
 
 This is intentionally conservative so the first run is easier to debug.
+The hybrid method is the recommended default when the starting parameters are
+far from the real cell because the bounded global search is more robust than
+starting directly with BPTT.
 
 ## Step 6: Inspect Learned Parameters
 
@@ -161,6 +164,7 @@ You will likely also want to save:
 - tighten Allen sweep filtering
 - verify current and voltage unit conventions carefully
 - consider positivity constraints for `tau_s`, `tau_a`, and `R_s`
+- prefer hybrid global-search-first fitting over pure TBPTT for the initial fit
 
 ## Known Caveat
 

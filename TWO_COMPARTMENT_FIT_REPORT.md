@@ -55,7 +55,9 @@ This pipeline includes:
 - masked voltage loss
 - smoothed spike-train loss
 - `w_Ca` sparsity regularization
-- truncated BPTT training loop using:
+- a bounded global-search fitting path for poor initializations
+- optional local polish and TBPTT refinement
+- the original truncated BPTT training loop using:
   - `functional.reset_net`
   - `functional.detach_net`
 
@@ -112,7 +114,7 @@ micromamba run -n btorch pip install allensdk
 2. Run the example fitting script:
 
 ```bash
-micromamba run -n btorch python examples/allen_two_compartment_fit.py --max-cells 1 --max-sweeps-per-cell 1 --epochs 5 --chunk-size 500 --dt-ms 0.5
+micromamba run -n btorch python examples/allen_two_compartment_fit.py --method hybrid --max-cells 1 --max-sweeps-per-cell 1 --epochs 5 --chunk-size 500 --dt-ms 0.5
 ```
 
 3. Inspect the learned parameters after training, for example:
@@ -128,3 +130,5 @@ for name, param in model.named_parameters():
 - save the trained state dict and learned parameters
 - add a report comparing predicted vs recorded voltage and spike timing
 - refine sweep filtering and unit normalization if the first fit is unstable
+- use the hybrid method by default when the initial parameter guess is far from
+  the biological regime
