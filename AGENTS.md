@@ -66,6 +66,9 @@ Key patterns:
 - Document `__init__` parameters in class docstring, not `__init__` method
 - Include mathematical model equations in `.. math::` blocks
 - Include cross-references with `:func:` and `:class:`
+- For every function you generate, document the motivation for the function,
+  every argument, and the return value or output behavior. If a function has
+  side effects, document those explicitly.
 
 ## Tests and checks
 
@@ -83,6 +86,13 @@ Key patterns:
 
 - Use pre-commit formatting before PRs: `pre-commit install --install-hooks`.
 - Keep changes modular; avoid mixing refactors with feature work.
+- Every time you make code or documentation changes, create a git commit for
+  that change set unless the user explicitly tells you not to.
+- After every such commit, update a Markdown progress report that records the
+  commit ID and summarizes the purpose, key changes, and verification status.
+- Do not frequently stop to ask for confirmation. Make reasonable assumptions
+  and finish as much of the plan as possible before asking, unless the choice
+  is risky, destructive, or blocked by missing information.
 
 ## Design principles
 
