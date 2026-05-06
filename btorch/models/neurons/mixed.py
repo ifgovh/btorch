@@ -81,6 +81,28 @@ class MixedNeuronPopulation(nn.Module):
         self.size = total
         self.step_mode = step_mode
 
+    def _concat_attr(self, attr: str) -> Tensor:
+        """Concatenate ``attr`` from all sub-populations along neuron dim."""
+        parts: list[Tensor] = []
+        for _, neuron in self.named_children():
+            val = getattr(neuron, attr, None)
+            if val is None:
+                raise AttributeError(
+                    f"{neuron.__class__.__name__} has no attribute {attr!r}"
+                )
+            if isinstance(val, nn.Parameter):
+                val = val.data
+            parts.append(val)
+        return torch.cat(parts, dim=-1)
+
+    @property
+    def v_threshold(self) -> Tensor:
+        return self._concat_attr("v_threshold")
+
+    @property
+    def v_reset(self) -> Tensor:
+        return self._concat_attr("v_reset")
+
     def _slice(self, x: Tensor, idx: int) -> Tensor:
         """Slice ``x`` along the last dimension for group *idx*."""
         start, end = self._cumsum[idx], self._cumsum[idx + 1]
