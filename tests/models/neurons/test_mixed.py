@@ -75,6 +75,80 @@ def test_mixed_apical_forward():
     assert not torch.allclose(i_a_with, i_a_without)
 
 
+def test_mixed_indexed_groups_preserve_logical_order():
+    """Indexed groups should scatter spikes back to original neuron positions.
+
+    This is the critical mode for connectome-backed networks where neuron
+    classes are interleaved in the sparse recurrent matrix.  The TC group can
+    be dispatched as a compact sub-population internally, but its output must
+    return to the original logical indices so recurrent weights, readouts, and
+    metadata stay aligned.
+    """
+    batch_size = 2
+    glif_idx = torch.tensor([0, 2, 4])
+    tc_idx = torch.tensor([1, 3])
+
+    glif = GLIF3(n_neuron=3, v_threshold=-50.0, step_mode="s")
+    tc = TwoCompartmentGLIF(n_neuron=2, v_threshold=-50.0, step_mode="s")
+    mixed = MixedNeuronPopulation(
+        {
+            "glif": (3, glif, glif_idx),
+            "tc": (2, tc, tc_idx),
+        },
+        step_mode="s",
+    )
+    init_net_state(mixed, batch_size=batch_size, dtype=DTYPE)
+
+    with torch.no_grad():
+        glif.v.fill_(-60.0)
+        tc.v.fill_(0.0)
+
+    x = torch.zeros(batch_size, 5, dtype=DTYPE)
+    with environ.context(dt=1.0):
+        spikes = mixed(x)
+
+    assert spikes.shape == (batch_size, 5)
+    assert torch.allclose(spikes[:, tc_idx], torch.ones_like(spikes[:, tc_idx]))
+    assert torch.allclose(
+        spikes[:, glif_idx], torch.zeros_like(spikes[:, glif_idx])
+    )
+
+
+def test_mixed_indexed_apical_routes_by_logical_indices():
+    """Indexed apical input should be gathered from TC logical positions.
+
+    The full ``x_apical`` tensor is expressed in recurrent-network coordinates.
+    With indexed groups, only values at the TC group's logical indices should
+    reach ``TwoCompartmentGLIF.i_a``; values at GLIF positions must be ignored.
+    """
+    batch_size = 1
+    glif_idx = torch.tensor([0, 2, 4])
+    tc_idx = torch.tensor([1, 3])
+
+    glif = GLIF3(n_neuron=3, step_mode="s")
+    tc = TwoCompartmentGLIF(n_neuron=2, step_mode="s")
+    mixed = MixedNeuronPopulation(
+        {
+            "glif": (3, glif, glif_idx),
+            "tc": (2, tc, tc_idx),
+        },
+        step_mode="s",
+    )
+    init_net_state(mixed, batch_size=batch_size, dtype=DTYPE)
+
+    x = torch.zeros(batch_size, 5, dtype=DTYPE)
+    x_apical = torch.zeros(batch_size, 5, dtype=DTYPE)
+    x_apical[:, glif_idx] = 100.0
+    x_apical[:, tc_idx] = torch.tensor([[5.0, 9.0]], dtype=DTYPE)
+
+    with environ.context(dt=1.0):
+        mixed(x, x_apical)
+
+    assert tc.i_a.shape == (batch_size, 2)
+    assert tc.i_a[0, 1] > tc.i_a[0, 0]
+    assert torch.all(tc.i_a < 1.0)
+
+
 def test_mixed_state_init():
     """init_net_state initialises sub-population memories recursively."""
     batch_size = 3
