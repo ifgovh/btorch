@@ -1,13 +1,19 @@
+import pytest
 import torch
 
 from btorch.analysis.two_compartment_fit import (
     AllenSweepBatch,
+    _fit_sweeps_once,
+    derive_population_parameter_bounds,
     evaluate_fit_across_sweeps,
     exponential_filter_spike_train,
+    extract_model_parameters,
     fit_two_compartment_model,
+    load_model_parameters,
     mask_post_spike_voltage_samples,
     save_fit_report,
     spike_timing_stats,
+    trim_traces_to_active_window,
     two_compartment_loss,
 )
 from btorch.models import environ
@@ -287,6 +293,77 @@ def test_global_fit_improves_tau_s_from_poor_initialization():
     assert abs(fitted_tau_s - 30.0) < abs(5.0 - 30.0)
 
 
+def test_cem_global_fit_improves_tau_s_from_poor_initialization():
+    torch.manual_seed(11)
+    target_model = TwoCompartmentGLIF(
+        n_neuron=1,
+        tau_s=28.0,
+        R_s=1.0,
+        E_L=-70.0,
+        tau_a=120.0,
+        tau_th=50.0,
+        delta_th=0.0,
+        delta_T=0.0,
+        w_Ca=0.0,
+        theta_Ca=2.0,
+        w_sa=0.0,
+        w_as=0.0,
+        v_threshold=1000.0,
+        step_mode="m",
+    )
+    init_net_state(target_model, batch_size=1, dtype=torch.float32)
+
+    i_soma = torch.linspace(0.0, 25.0, 20).view(20, 1, 1)
+    i_apical = torch.zeros_like(i_soma)
+    with environ.context(dt=1.0):
+        spike_true, v_true = target_model.multi_step_forward(i_soma, i_apical)
+
+    fit_model = TwoCompartmentGLIF(
+        n_neuron=1,
+        tau_s=6.0,
+        R_s=1.0,
+        E_L=-70.0,
+        tau_a=120.0,
+        tau_th=50.0,
+        delta_th=0.0,
+        delta_T=0.0,
+        w_Ca=0.0,
+        theta_Ca=2.0,
+        w_sa=0.0,
+        w_as=0.0,
+        v_threshold=1000.0,
+        step_mode="m",
+        trainable_param={"tau_s"},
+    )
+    sweep = AllenSweepBatch(
+        specimen_id=1,
+        sweep_number=1,
+        dt_ms=1.0,
+        i_soma=i_soma,
+        v_true=v_true.detach(),
+        spike_true=spike_true.detach(),
+        i_apical=i_apical,
+        metadata={"synthetic": True},
+    )
+
+    history = fit_two_compartment_model(
+        fit_model,
+        [sweep],
+        method="global",
+        global_strategy="cem",
+        global_maxiter=3,
+        global_popsize=3,
+        local_maxiter=10,
+        param_bounds={"tau_s": (1.0, 60.0)},
+        seed=0,
+    )
+
+    fitted_tau_s = float(fit_model.tau_s.detach().cpu())
+    assert history
+    assert any(str(row["phase"]).startswith("global_cem") for row in history)
+    assert abs(fitted_tau_s - 28.0) < abs(6.0 - 28.0)
+
+
 def test_staged_fit_runs_with_mixed_sweeps():
     torch.manual_seed(3)
     target_model = TwoCompartmentGLIF(
@@ -444,3 +521,114 @@ def test_fit_evaluation_and_report_outputs(tmp_path):
     assert paths["metrics"].exists()
     assert paths["history"].exists()
     assert paths["plot"].exists()
+
+
+def test_population_parameter_bounds_and_loading_round_trip():
+    model = TwoCompartmentGLIF(n_neuron=1, step_mode="m")
+    parameter_sets = [
+        {"tau_s": 18.0, "R_s": 0.08, "v_threshold": -47.0},
+        {"tau_s": 21.0, "R_s": 0.11, "v_threshold": -45.5},
+        {"tau_s": 19.5, "R_s": 0.09, "v_threshold": -46.0},
+    ]
+
+    bounds = derive_population_parameter_bounds(
+        parameter_sets,
+        margin_fraction=0.1,
+        min_fraction_of_default=0.1,
+    )
+    assert bounds["tau_s"][0] >= 5.0
+    assert bounds["tau_s"][1] <= 80.0
+    assert bounds["R_s"][0] < 0.1 < bounds["R_s"][1]
+
+    load_model_parameters(
+        model,
+        {"tau_s": 20.0, "R_s": 0.1, "v_threshold": -46.0},
+    )
+    extracted = extract_model_parameters(model)
+    assert extracted["tau_s"] == pytest.approx(20.0)
+    assert extracted["R_s"] == pytest.approx(0.1)
+    assert extracted["v_threshold"] == pytest.approx(-46.0)
+
+
+def test_fit_metrics_can_balance_by_specimen_instead_of_sweep_count():
+    model = TwoCompartmentGLIF(
+        n_neuron=1,
+        tau_s=20.0,
+        R_s=1.0,
+        E_L=-70.0,
+        tau_a=120.0,
+        tau_th=50.0,
+        delta_th=0.0,
+        delta_T=0.0,
+        w_Ca=0.0,
+        theta_Ca=1.0,
+        w_sa=0.0,
+        w_as=0.0,
+        v_threshold=1000.0,
+        step_mode="m",
+    )
+    init_net_state(model, batch_size=1, dtype=torch.float32)
+
+    i_ok = torch.ones(10, 1, 1)
+    i_bad = torch.full((10, 1, 1), 5.0)
+    i_apical = torch.zeros_like(i_ok)
+    with environ.context(dt=1.0):
+        spike_ok, v_ok = model.multi_step_forward(i_ok, i_apical)
+        reset_net(model, batch_size=1)
+        spike_bad, _ = model.multi_step_forward(i_bad, i_apical)
+
+    sweeps = [
+        AllenSweepBatch(
+            specimen_id=1,
+            sweep_number=1,
+            dt_ms=1.0,
+            i_soma=i_ok,
+            v_true=v_ok.detach(),
+            spike_true=spike_ok.detach(),
+            i_apical=i_apical,
+        ),
+        AllenSweepBatch(
+            specimen_id=1,
+            sweep_number=2,
+            dt_ms=1.0,
+            i_soma=i_ok,
+            v_true=v_ok.detach(),
+            spike_true=spike_ok.detach(),
+            i_apical=i_apical,
+        ),
+        AllenSweepBatch(
+            specimen_id=2,
+            sweep_number=3,
+            dt_ms=1.0,
+            i_soma=i_bad,
+            v_true=v_ok.detach(),
+            spike_true=spike_bad.detach(),
+            i_apical=i_apical,
+        ),
+    ]
+
+    unbalanced = _fit_sweeps_once(model, sweeps, specimen_balanced=False)
+    balanced = _fit_sweeps_once(model, sweeps, specimen_balanced=True)
+
+    assert balanced["total_loss"] > unbalanced["total_loss"]
+
+
+def test_trim_traces_to_active_window_keeps_stimulus_with_padding():
+    voltage = torch.linspace(-70.0, -55.0, 20)
+    current = torch.zeros(20)
+    current[5:11] = 40.0
+
+    voltage_trimmed, current_trimmed, metadata = trim_traces_to_active_window(
+        voltage,
+        current,
+        dt_ms=1.0,
+        pre_pad_ms=2.0,
+        post_pad_ms=3.0,
+        activity_threshold_pa=5.0,
+    )
+
+    assert tuple(voltage_trimmed.shape) == (11,)
+    assert tuple(current_trimmed.shape) == (11,)
+    assert metadata["trim_start_index"] == 3.0
+    assert metadata["trim_stop_index"] == 13.0
+    torch.testing.assert_close(current_trimmed[2:8], torch.full((6,), 40.0))

@@ -342,6 +342,76 @@ def resample_trace(
     return torch.from_numpy(np_resampled).to(dtype=torch.float32)
 
 
+def trim_traces_to_active_window(
+    voltage: Tensor,
+    current: Tensor,
+    *,
+    dt_ms: float,
+    pre_pad_ms: float = 100.0,
+    post_pad_ms: float = 150.0,
+    activity_threshold_pa: float = 5.0,
+) -> tuple[Tensor, Tensor, dict[str, float]]:
+    """Trim resampled traces to the current-active window plus padding.
+
+    Args:
+        voltage: Voltage trace shaped ``(T,)`` in mV.
+        current: Current trace shaped ``(T,)`` in pA.
+        dt_ms: Timestep in milliseconds.
+        pre_pad_ms: Context kept before the detected stimulus onset.
+        post_pad_ms: Context kept after the detected stimulus offset.
+        activity_threshold_pa: Minimum absolute current considered active.
+
+    Returns:
+        A tuple ``(voltage_trimmed, current_trimmed, metadata)`` where
+        ``metadata`` records the kept sample bounds in the original trace.
+    """
+    if dt_ms <= 0.0:
+        raise ValueError(f"dt_ms must be positive, got {dt_ms}.")
+    if pre_pad_ms < 0.0 or post_pad_ms < 0.0:
+        raise ValueError("pre_pad_ms and post_pad_ms must be non-negative.")
+
+    if voltage.ndim != 1 or current.ndim != 1:
+        raise ValueError(
+            "trim_traces_to_active_window expects 1D traces, got "
+            f"{tuple(voltage.shape)} and {tuple(current.shape)}."
+        )
+    if voltage.shape != current.shape:
+        raise ValueError(
+            "voltage and current must have identical shapes, got "
+            f"{tuple(voltage.shape)} and {tuple(current.shape)}."
+        )
+
+    current_abs = current.abs()
+    max_current = float(current_abs.max().item())
+    threshold = max(activity_threshold_pa, 0.1 * max_current)
+    active = current_abs >= threshold
+    active_idx = torch.nonzero(active).flatten()
+    if active_idx.numel() == 0:
+        return voltage, current, {
+            "trim_start_index": 0.0,
+            "trim_stop_index": float(voltage.shape[0] - 1),
+            "trim_start_ms": 0.0,
+            "trim_stop_ms": float((voltage.shape[0] - 1) * dt_ms),
+            "trimmed": 0.0,
+        }
+
+    pre_pad_bins = int(round(pre_pad_ms / dt_ms))
+    post_pad_bins = int(round(post_pad_ms / dt_ms))
+    start_idx = max(int(active_idx[0].item()) - pre_pad_bins, 0)
+    stop_idx = min(
+        int(active_idx[-1].item()) + post_pad_bins,
+        int(voltage.shape[0] - 1),
+    )
+    window = slice(start_idx, stop_idx + 1)
+    return voltage[window], current[window], {
+        "trim_start_index": float(start_idx),
+        "trim_stop_index": float(stop_idx),
+        "trim_start_ms": float(start_idx * dt_ms),
+        "trim_stop_ms": float(stop_idx * dt_ms),
+        "trimmed": float(start_idx > 0 or stop_idx < voltage.shape[0] - 1),
+    }
+
+
 def load_allen_sweep(
     specimen_id: int,
     sweep_number: int,
@@ -352,6 +422,10 @@ def load_allen_sweep(
     voltage_spike_threshold: float = 0.0,
     voltage_scale: float = 1e3,
     current_scale: float = 1e12,
+    trim_to_stimulus: bool = True,
+    trim_pre_pad_ms: float = 100.0,
+    trim_post_pad_ms: float = 150.0,
+    trim_activity_threshold_pa: float = 5.0,
 ) -> AllenSweepBatch:
     """Load one Allen ephys sweep and convert it to time-first torch tensors.
 
@@ -384,6 +458,22 @@ def load_allen_sweep(
     )
     voltage = voltage * float(voltage_scale)
     current = current * float(current_scale)
+    trim_metadata = {
+        "trim_start_index": 0.0,
+        "trim_stop_index": float(current.shape[0] - 1),
+        "trim_start_ms": 0.0,
+        "trim_stop_ms": float((current.shape[0] - 1) * dt_ms),
+        "trimmed": 0.0,
+    }
+    if trim_to_stimulus:
+        voltage, current, trim_metadata = trim_traces_to_active_window(
+            voltage,
+            current,
+            dt_ms=dt_ms,
+            pre_pad_ms=trim_pre_pad_ms,
+            post_pad_ms=trim_post_pad_ms,
+            activity_threshold_pa=trim_activity_threshold_pa,
+        )
     spike_true = detect_spikes_from_voltage(
         voltage,
         threshold=voltage_spike_threshold,
@@ -401,6 +491,11 @@ def load_allen_sweep(
             "sampling_rate_hz": sampling_rate,
             "voltage_scale": voltage_scale,
             "current_scale": current_scale,
+            "trim_to_stimulus": float(trim_to_stimulus),
+            "trim_pre_pad_ms": float(trim_pre_pad_ms),
+            "trim_post_pad_ms": float(trim_post_pad_ms),
+            "trim_activity_threshold_pa": float(trim_activity_threshold_pa),
+            **trim_metadata,
         },
     )
 
@@ -1035,6 +1130,112 @@ def save_fit_report(
     }
 
 
+def _named_model_tensors(model) -> dict[str, Tensor]:
+    """Return model parameters and persistent buffers by name."""
+    tensors = {name: tensor for name, tensor in model.named_buffers()}
+    tensors.update({name: tensor for name, tensor in model.named_parameters()})
+    return tensors
+
+
+def extract_model_parameters(model) -> dict[str, float]:
+    """Extract scalar parameter values from a fitted model."""
+    tensors = _named_model_tensors(model)
+    return {
+        name: float(tensor.detach().cpu().reshape(-1)[0].item())
+        for name, tensor in tensors.items()
+        if name in DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS
+    }
+
+
+def load_model_parameters(
+    model,
+    parameters: dict[str, float],
+    *,
+    strict: bool = False,
+) -> None:
+    """Load scalar parameters into a model in-place."""
+    known_params = _named_model_tensors(model)
+    for name, value in parameters.items():
+        if name not in known_params:
+            if strict:
+                raise KeyError(f"Unknown parameter '{name}'.")
+            continue
+        target = known_params[name]
+        value_t = torch.full_like(target, float(value))
+        with torch.no_grad():
+            target.copy_(value_t)
+
+
+def derive_population_parameter_bounds(
+    parameter_sets: Sequence[dict[str, float]],
+    *,
+    default_bounds: dict[str, tuple[float, float]] | None = None,
+    margin_fraction: float = 0.15,
+    min_fraction_of_default: float = 0.2,
+) -> dict[str, tuple[float, float]]:
+    """Derive tighter bounds from a collection of fitted parameter sets.
+
+    Args:
+        parameter_sets: Per-fit scalar parameter dictionaries.
+        default_bounds: Baseline bounds used to clip and widen priors.
+        margin_fraction: Fraction of the observed parameter spread added to the
+            robust interval on both sides.
+        min_fraction_of_default: Minimum retained width relative to the default
+            bound width so priors remain conservative.
+
+    Returns:
+        Bounds keyed by parameter name. Parameters without enough observations
+        fall back to the provided defaults.
+    """
+    if margin_fraction < 0.0:
+        raise ValueError(
+            f"margin_fraction must be non-negative, got {margin_fraction}."
+        )
+    if min_fraction_of_default <= 0.0:
+        raise ValueError(
+            "min_fraction_of_default must be positive, got "
+            f"{min_fraction_of_default}."
+        )
+
+    merged_defaults = dict(DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS)
+    if default_bounds is not None:
+        merged_defaults.update(default_bounds)
+
+    if not parameter_sets:
+        return merged_defaults
+
+    derived: dict[str, tuple[float, float]] = {}
+    for name, default_bound in merged_defaults.items():
+        samples = np.asarray(
+            [
+                float(params[name])
+                for params in parameter_sets
+                if name in params and np.isfinite(float(params[name]))
+            ],
+            dtype=np.float64,
+        )
+        if samples.size == 0:
+            derived[name] = default_bound
+            continue
+
+        default_low, default_high = default_bound
+        default_width = default_high - default_low
+        median = float(np.median(samples))
+        sample_low = float(np.min(samples))
+        sample_high = float(np.max(samples))
+        spread = sample_high - sample_low
+        margin = max(
+            spread * margin_fraction,
+            default_width * min_fraction_of_default * 0.5,
+        )
+        lower = max(default_low, median - 0.5 * spread - margin)
+        upper = min(default_high, median + 0.5 * spread + margin)
+        if lower >= upper:
+            lower, upper = default_bound
+        derived[name] = (float(lower), float(upper))
+    return derived
+
+
 def _fit_sweeps_once(
     model,
     sweeps: Iterable[AllenSweepBatch],
@@ -1052,15 +1253,10 @@ def _fit_sweeps_once(
     post_spike_mask_ms: float = 3.0,
     spike_match_window_ms: float = 10.0,
     spike_miss_penalty_ms: float | None = None,
+    specimen_balanced: bool = True,
 ) -> dict[str, float]:
     """Evaluate the current model parameters on one or more sweeps."""
-    total_loss = 0.0
-    total_voltage = 0.0
-    total_spike = 0.0
-    total_spike_count = 0.0
-    total_spike_timing = 0.0
-    total_sparsity = 0.0
-    sweep_count = 0
+    grouped_metrics: dict[int, list[dict[str, float]]] = {}
 
     with torch.no_grad():
         for sweep in sweeps:
@@ -1106,24 +1302,43 @@ def _fit_sweeps_once(
                     spike_miss_penalty_ms=spike_miss_penalty_ms,
                 )
 
-            total_loss += float(losses["total"].detach().cpu())
-            total_voltage += float(losses["voltage"].detach().cpu())
-            total_spike += float(losses["spike"].detach().cpu())
-            total_spike_count += float(losses["spike_count"].detach().cpu())
-            total_spike_timing += float(losses["spike_timing"].detach().cpu())
-            total_sparsity += float(losses["sparsity"].detach().cpu())
-            sweep_count += 1
+            grouped_metrics.setdefault(int(sweep.specimen_id), []).append(
+                {
+                    "total_loss": float(losses["total"].detach().cpu()),
+                    "voltage_loss": float(losses["voltage"].detach().cpu()),
+                    "spike_loss": float(losses["spike"].detach().cpu()),
+                    "spike_count_loss": float(
+                        losses["spike_count"].detach().cpu()
+                    ),
+                    "spike_timing_loss": float(
+                        losses["spike_timing"].detach().cpu()
+                    ),
+                    "sparsity_loss": float(losses["sparsity"].detach().cpu()),
+                }
+            )
 
-    if sweep_count == 0:
+    if not grouped_metrics:
         raise ValueError("At least one sweep is required for fitting.")
 
+    specimen_metrics = []
+    for per_specimen in grouped_metrics.values():
+        specimen_metrics.append(
+            {
+                key: float(np.mean([row[key] for row in per_specimen]))
+                for key in per_specimen[0]
+            }
+        )
+
+    if specimen_balanced:
+        aggregate_rows = specimen_metrics
+    else:
+        aggregate_rows = [
+            row for per_specimen in grouped_metrics.values() for row in per_specimen
+        ]
+
     return {
-        "total_loss": total_loss / sweep_count,
-        "voltage_loss": total_voltage / sweep_count,
-        "spike_loss": total_spike / sweep_count,
-        "spike_count_loss": total_spike_count / sweep_count,
-        "spike_timing_loss": total_spike_timing / sweep_count,
-        "sparsity_loss": total_sparsity / sweep_count,
+        key: float(np.mean([row[key] for row in aggregate_rows]))
+        for key in aggregate_rows[0]
     }
 
 
@@ -1391,6 +1606,7 @@ def _fit_two_compartment_model_tbptt(
     post_spike_mask_ms: float = 3.0,
     spike_match_window_ms: float = 10.0,
     spike_miss_penalty_ms: float | None = None,
+    specimen_balanced: bool = True,
 ) -> list[dict[str, float | str]]:
     """Fit the model to Allen sweeps with truncated BPTT.
 
@@ -1510,12 +1726,17 @@ def _fit_two_compartment_model_global(
     local_maxiter: int = 50,
     seed: int | None = 0,
     polish: bool = True,
+    specimen_balanced: bool = True,
+    global_strategy: Literal["de", "cem"] = "de",
 ) -> list[dict[str, float | str]]:
     """Fit with bounded global search and optional local L-BFGS-B polish."""
     sweep_list = list(sweeps)
     x0, slices = _pack_trainable_parameters(model)
     bounds = _build_parameter_bounds(model, slices, param_bounds=param_bounds)
     history: list[dict[str, float | str]] = []
+    rng = np.random.default_rng(seed)
+    lower = np.asarray([bound[0] for bound in bounds], dtype=np.float64)
+    upper = np.asarray([bound[1] for bound in bounds], dtype=np.float64)
 
     def objective(x: np.ndarray) -> float:
         _set_trainable_parameters(model, x, slices)
@@ -1535,19 +1756,57 @@ def _fit_two_compartment_model_global(
             post_spike_mask_ms=post_spike_mask_ms,
             spike_match_window_ms=spike_match_window_ms,
             spike_miss_penalty_ms=spike_miss_penalty_ms,
+            specimen_balanced=specimen_balanced,
         )
         return metrics["total_loss"]
 
-    global_result = optimize.differential_evolution(
-        objective,
-        bounds=bounds,
-        maxiter=global_maxiter,
-        popsize=global_popsize,
-        seed=seed,
-        polish=False,
-        updating="deferred",
-    )
-    _set_trainable_parameters(model, global_result.x, slices)
+    if global_strategy == "de":
+        global_result = optimize.differential_evolution(
+            objective,
+            bounds=bounds,
+            maxiter=global_maxiter,
+            popsize=global_popsize,
+            seed=seed,
+            polish=False,
+            updating="deferred",
+        )
+        best_x = np.asarray(global_result.x, dtype=np.float64)
+    elif global_strategy == "cem":
+        population_size = max(global_popsize * max(len(bounds), 4), 12)
+        elite_count = max(population_size // 4, 4)
+        mean = np.clip(x0.astype(np.float64), lower, upper)
+        std = np.maximum((upper - lower) * 0.25, 1e-3)
+        best_x = mean.copy()
+        best_loss = float("inf")
+
+        for _ in range(max(global_maxiter, 1)):
+            population = rng.normal(
+                loc=mean,
+                scale=std,
+                size=(population_size, mean.size),
+            )
+            population = np.clip(population, lower, upper)
+            population[0] = mean
+            population[1] = lower + rng.random(mean.size) * (upper - lower)
+            losses = np.asarray([objective(x) for x in population], dtype=np.float64)
+            elite_idx = np.argsort(losses)[:elite_count]
+            elite = population[elite_idx]
+            elite_losses = losses[elite_idx]
+            mean = elite.mean(axis=0)
+            std = np.maximum(elite.std(axis=0), (upper - lower) * 0.05)
+            if float(elite_losses[0]) < best_loss:
+                best_loss = float(elite_losses[0])
+                best_x = elite[0].copy()
+        global_result = optimize.OptimizeResult(
+            x=best_x,
+            fun=best_loss,
+            success=True,
+            message="cem",
+        )
+    else:
+        raise ValueError(f"Unknown global_strategy: {global_strategy}.")
+
+    _set_trainable_parameters(model, best_x, slices)
     metrics = _fit_sweeps_once(
         model,
         sweep_list,
@@ -1564,10 +1823,11 @@ def _fit_two_compartment_model_global(
         post_spike_mask_ms=post_spike_mask_ms,
         spike_match_window_ms=spike_match_window_ms,
         spike_miss_penalty_ms=spike_miss_penalty_ms,
+        specimen_balanced=specimen_balanced,
     )
     history.append(
         {
-            "phase": "global",
+            "phase": f"global_{global_strategy}",
             "epoch": 0.0,
             "specimen_id": -1.0,
             "sweep_number": -1.0,
@@ -1586,7 +1846,7 @@ def _fit_two_compartment_model_global(
 
     local_result = optimize.minimize(
         objective,
-        global_result.x,
+        best_x,
         method="L-BFGS-B",
         bounds=bounds,
         options={"maxiter": int(local_maxiter)},
@@ -1608,6 +1868,7 @@ def _fit_two_compartment_model_global(
         post_spike_mask_ms=post_spike_mask_ms,
         spike_match_window_ms=spike_match_window_ms,
         spike_miss_penalty_ms=spike_miss_penalty_ms,
+        specimen_balanced=specimen_balanced,
     )
     history.append(
         {
@@ -1651,6 +1912,8 @@ def _fit_two_compartment_model_staged(
     seed: int | None = 0,
     polish: bool = True,
     stages: Sequence[TwoCompartmentFitStage] | None = None,
+    specimen_balanced: bool = True,
+    global_strategy: Literal["de", "cem"] = "de",
 ) -> list[dict[str, float | str]]:
     """Fit the model in identifiable stages with bounded search."""
     sweep_list = list(sweeps)
@@ -1711,6 +1974,8 @@ def _fit_two_compartment_model_staged(
                 local_maxiter=local_maxiter,
                 seed=None if seed is None else seed + stage_index,
                 polish=polish,
+                specimen_balanced=specimen_balanced,
+                global_strategy=global_strategy,
             )
         finally:
             _restore_trainable_parameter_names(model, previous)
@@ -1775,6 +2040,8 @@ def fit_two_compartment_model(
     seed: int | None = 0,
     polish: bool = True,
     stages: Sequence[TwoCompartmentFitStage] | None = None,
+    specimen_balanced: bool = True,
+    global_strategy: Literal["de", "cem"] = "de",
 ) -> list[dict[str, float | str]]:
     """Fit the model with a robust strategy for poor initialization.
 
@@ -1844,6 +2111,7 @@ def fit_two_compartment_model(
             post_spike_mask_ms=post_spike_mask_ms,
             spike_match_window_ms=spike_match_window_ms,
             spike_miss_penalty_ms=spike_miss_penalty_ms,
+            specimen_balanced=specimen_balanced,
         )
 
     if method == "staged":
@@ -1870,6 +2138,8 @@ def fit_two_compartment_model(
             seed=seed,
             polish=polish,
             stages=stages,
+            specimen_balanced=specimen_balanced,
+            global_strategy=global_strategy,
         )
 
     history = _fit_two_compartment_model_global(
@@ -1894,6 +2164,8 @@ def fit_two_compartment_model(
         local_maxiter=local_maxiter,
         seed=seed,
         polish=polish,
+        specimen_balanced=specimen_balanced,
+        global_strategy=global_strategy,
     )
     if method == "global":
         return history
@@ -1931,12 +2203,15 @@ __all__ = [
     "TwoCompartmentFitStage",
     "choose_current_clamp_sweeps",
     "detect_spikes_from_voltage",
+    "derive_population_parameter_bounds",
     "evaluate_fit_across_sweeps",
     "evaluate_two_compartment_fit",
+    "extract_model_parameters",
     "exponential_filter_spike_train",
     "filter_mouse_visp_l5_pyramidal_cells",
     "fit_two_compartment_model",
     "get_cell_types_cache",
+    "load_model_parameters",
     "load_allen_sweep",
     "mask_post_spike_voltage_samples",
     "plot_two_compartment_fit",
@@ -1946,5 +2221,6 @@ __all__ = [
     "save_fit_report",
     "spike_timing_loss",
     "spike_timing_stats",
+    "trim_traces_to_active_window",
     "two_compartment_loss",
 ]

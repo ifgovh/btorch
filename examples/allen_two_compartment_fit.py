@@ -14,6 +14,7 @@ AllenSDK is required to run this script.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,9 +24,12 @@ import torch
 from btorch.analysis.two_compartment_fit import (
     DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
     choose_current_clamp_sweeps,
+    derive_population_parameter_bounds,
     evaluate_fit_across_sweeps,
+    extract_model_parameters,
     fit_two_compartment_model,
     load_allen_sweep,
+    load_model_parameters,
     query_mouse_visp_l5_pyramidal_cells,
     save_fit_report,
 )
@@ -35,6 +39,7 @@ from btorch.models.neurons import TwoCompartmentGLIF
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest-file", type=str, default=None)
+    parser.add_argument("--specimen-ids", type=int, nargs="*", default=None)
     parser.add_argument("--max-cells", type=int, default=1)
     parser.add_argument("--candidate-cells", type=int, default=8)
     parser.add_argument("--max-sweeps-per-cell", type=int, default=6)
@@ -57,9 +62,35 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("hybrid", "global", "tbptt", "staged"),
         default="staged",
     )
+    parser.add_argument(
+        "--global-strategy",
+        type=str,
+        choices=("de", "cem"),
+        default="de",
+    )
     parser.add_argument("--global-maxiter", type=int, default=20)
     parser.add_argument("--global-popsize", type=int, default=8)
     parser.add_argument("--local-maxiter", type=int, default=50)
+    parser.add_argument("--trim-to-stimulus", action="store_true", default=True)
+    parser.add_argument("--no-trim-to-stimulus", action="store_false",
+                        dest="trim_to_stimulus")
+    parser.add_argument("--trim-pre-pad-ms", type=float, default=100.0)
+    parser.add_argument("--trim-post-pad-ms", type=float, default=150.0)
+    parser.add_argument("--trim-activity-threshold-pa", type=float, default=5.0)
+    parser.add_argument("--prefit-cells", type=int, default=0)
+    parser.add_argument(
+        "--prefit-method",
+        type=str,
+        choices=("staged", "global", "tbptt", "hybrid"),
+        default="tbptt",
+    )
+    parser.add_argument("--prefit-epochs", type=int, default=1)
+    parser.add_argument("--prefit-global-maxiter", type=int, default=2)
+    parser.add_argument("--prefit-global-popsize", type=int, default=4)
+    parser.add_argument("--prefit-local-maxiter", type=int, default=10)
+    parser.add_argument("--prior-margin-fraction", type=float, default=0.2)
+    parser.add_argument("--prior-min-fraction-default", type=float, default=0.2)
+    parser.add_argument("--zero-shot-cells", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--output-dir",
@@ -470,80 +501,8 @@ def _ensure_sustained_coverage(
     return train, test
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    cells = query_mouse_visp_l5_pyramidal_cells(manifest_file=args.manifest_file)
-    if not cells:
-        raise RuntimeError("No mouse VISp layer-5 pyramidal candidates were found.")
-
-    candidate_payloads = []
-    search_cells = cells[: max(args.max_cells, args.candidate_cells)]
-    from btorch.analysis.two_compartment_fit import get_cell_types_cache
-
-    cache = get_cell_types_cache(args.manifest_file)
-    for cell in search_cells:
-        specimen_id = int(cell.get("specimen_id") or cell.get("id"))
-        sweep_records = cache.get_ephys_sweeps(specimen_id)
-        chosen = choose_current_clamp_sweeps(sweep_records)
-        loaded = [
-            load_allen_sweep(
-                specimen_id=specimen_id,
-                sweep_number=int(sweep["sweep_number"]),
-                dt_ms=args.dt_ms,
-                manifest_file=args.manifest_file,
-                cache=cache,
-            )
-            for sweep in chosen
-        ]
-        if not loaded:
-            continue
-        candidate_payloads.append((specimen_id, loaded, _cell_richness_score(loaded)))
-
-    candidate_payloads.sort(key=lambda item: item[2], reverse=True)
-    selected_payloads = candidate_payloads[: args.max_cells]
-
-    train_sweeps = []
-    test_sweeps = []
-    for specimen_id, loaded, richness in selected_payloads:
-        selected = _select_representative_sweeps(loaded, args.max_sweeps_per_cell)
-        train_split, test_split = _stratified_split_sweeps(
-            selected,
-            args.test_fraction,
-        )
-        train_split, test_split = _ensure_spiking_coverage(
-            train_split,
-            test_split,
-            selected,
-        )
-        train_split, test_split = _ensure_lowrate_coverage(
-            train_split,
-            test_split,
-            selected,
-        )
-        train_split, test_split = _ensure_sustained_coverage(
-            train_split,
-            test_split,
-            selected,
-        )
-        train_sweeps.extend(train_split)
-        test_sweeps.extend(test_split)
-        print(
-            "Selected specimen",
-            specimen_id,
-            "richness=",
-            richness,
-            "train=",
-            [sweep.sweep_number for sweep in train_split],
-            "test=",
-            [sweep.sweep_number for sweep in test_split],
-        )
-
-    if not train_sweeps:
-        raise RuntimeError("No suitable current-clamp sweeps were found.")
-
-    model = TwoCompartmentGLIF(
+def _build_default_model(device: str) -> TwoCompartmentGLIF:
+    return TwoCompartmentGLIF(
         n_neuron=1,
         tau_s=25.0,
         R_s=0.08,
@@ -575,12 +534,39 @@ def main() -> None:
         },
     ).to(device)
 
+
+def _median_parameter_set(parameter_sets: list[dict[str, float]]) -> dict[str, float]:
+    if not parameter_sets:
+        return {}
+    names = parameter_sets[0].keys()
+    median_parameters = {}
+    for name in names:
+        values = [float(params[name]) for params in parameter_sets if name in params]
+        if values:
+            median_parameters[name] = float(torch.tensor(values).median().item())
+    return median_parameters
+
+
+def _fit_model_bundle(
+    *,
+    model: TwoCompartmentGLIF,
+    train_sweeps: list,
+    test_sweeps: list,
+    output_dir: Path,
+    args,
+    param_bounds: dict[str, tuple[float, float]] | None = None,
+    global_maxiter: int | None = None,
+    global_popsize: int | None = None,
+    local_maxiter: int | None = None,
+    method: str | None = None,
+    epochs: int | None = None,
+) -> dict:
     history = fit_two_compartment_model(
         model,
         train_sweeps,
-        method=args.method,
+        method=args.method if method is None else method,
         lr=args.lr,
-        epochs=args.epochs,
+        epochs=args.epochs if epochs is None else epochs,
         chunk_size=args.chunk_size,
         voltage_weight=args.voltage_weight,
         spike_weight=args.spike_weight,
@@ -588,12 +574,17 @@ def main() -> None:
         spike_timing_weight=args.spike_timing_weight,
         spike_match_window_ms=args.spike_match_window_ms,
         sparsity_weight=args.sparsity_weight,
-        global_maxiter=args.global_maxiter,
-        global_popsize=args.global_popsize,
-        local_maxiter=args.local_maxiter,
-        param_bounds=DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
+        global_strategy=args.global_strategy,
+        global_maxiter=(
+            args.global_maxiter if global_maxiter is None else global_maxiter
+        ),
+        global_popsize=(
+            args.global_popsize if global_popsize is None else global_popsize
+        ),
+        local_maxiter=args.local_maxiter if local_maxiter is None else local_maxiter,
+        param_bounds=param_bounds or DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
         seed=args.seed,
-        device=device,
+        device=model.v_threshold.device,
     )
     if args.tbptt_refine_epochs > 0:
         tbptt_history = fit_two_compartment_model(
@@ -609,13 +600,14 @@ def main() -> None:
             spike_timing_weight=max(args.spike_timing_weight, 12.0),
             spike_match_window_ms=args.spike_match_window_ms,
             sparsity_weight=args.sparsity_weight,
-            device=device,
+            device=model.v_threshold.device,
         )
         history.extend(tbptt_history)
+
     train_evaluations, train_aggregate = evaluate_fit_across_sweeps(
         model,
         train_sweeps,
-        device=device,
+        device=model.v_threshold.device,
         spike_count_weight=args.spike_count_weight,
         spike_timing_weight=args.spike_timing_weight,
         spike_match_window_ms=args.spike_match_window_ms,
@@ -625,16 +617,16 @@ def main() -> None:
         train_evaluations,
         train_aggregate,
         history,
-        output_dir=Path(args.output_dir) / "train",
+        output_dir=output_dir / "train",
     )
 
-    test_aggregate = {}
-    test_paths = {}
+    test_aggregate: dict[str, float] = {}
+    test_paths: dict[str, Path] = {}
     if test_sweeps:
         test_evaluations, test_aggregate = evaluate_fit_across_sweeps(
             model,
             test_sweeps,
-            device=device,
+            device=model.v_threshold.device,
             spike_count_weight=args.spike_count_weight,
             spike_timing_weight=args.spike_timing_weight,
             spike_match_window_ms=args.spike_match_window_ms,
@@ -644,10 +636,328 @@ def main() -> None:
             test_evaluations,
             test_aggregate,
             [],
-            output_dir=Path(args.output_dir) / "test",
+            output_dir=output_dir / "test",
+        )
+    else:
+        test_evaluations = []
+
+    return {
+        "model": model,
+        "history": history,
+        "train_evaluations": train_evaluations,
+        "train_aggregate": train_aggregate,
+        "train_paths": train_paths,
+        "test_evaluations": test_evaluations,
+        "test_aggregate": test_aggregate,
+        "test_paths": test_paths,
+        "parameters": extract_model_parameters(model),
+    }
+
+
+def _evaluate_zero_shot(
+    *,
+    model: TwoCompartmentGLIF,
+    candidate_payloads: list[tuple[int, list, tuple[float, float, float]]],
+    used_specimen_ids: set[int],
+    args,
+    output_dir: Path,
+) -> dict[str, float] | None:
+    if args.zero_shot_cells <= 0:
+        return None
+
+    zero_shot_sweeps = []
+    zero_shot_specimens = []
+    for specimen_id, loaded, richness in candidate_payloads:
+        if specimen_id in used_specimen_ids:
+            continue
+        selected = _select_representative_sweeps(loaded, args.max_sweeps_per_cell)
+        if not selected:
+            continue
+        zero_shot_specimens.append(
+            {
+                "specimen_id": specimen_id,
+                "richness": richness,
+                "sweeps": [sweep.sweep_number for sweep in selected],
+            }
+        )
+        zero_shot_sweeps.extend(selected)
+        if len(zero_shot_specimens) >= args.zero_shot_cells:
+            break
+
+    if not zero_shot_sweeps:
+        return None
+
+    zero_shot_evaluations, zero_shot_aggregate = evaluate_fit_across_sweeps(
+        model,
+        zero_shot_sweeps,
+        device=model.v_threshold.device,
+        spike_count_weight=args.spike_count_weight,
+        spike_timing_weight=args.spike_timing_weight,
+        spike_match_window_ms=args.spike_match_window_ms,
+    )
+    save_fit_report(
+        model,
+        zero_shot_evaluations,
+        zero_shot_aggregate,
+        [],
+        output_dir=output_dir / "zero_shot",
+    )
+    zero_shot_aggregate["n_zero_shot_specimens"] = float(len(zero_shot_specimens))
+    with (output_dir / "zero_shot" / "selection.json").open("w", encoding="utf-8") as f:
+        json.dump(zero_shot_specimens, f, indent=2)
+    return zero_shot_aggregate
+
+
+def _write_run_summary(
+    *,
+    output_dir: Path,
+    train_aggregate: dict[str, float],
+    test_aggregate: dict[str, float],
+    zero_shot_aggregate: dict[str, float] | None,
+    derived_bounds: dict[str, tuple[float, float]] | None,
+    prefit_summaries: list[dict],
+) -> None:
+    lines = [
+        "# Two-Compartment Allen Fit Summary",
+        "",
+        "## Final Shared Fit",
+        "",
+        f"- Train sweeps: {int(train_aggregate.get('n_sweeps', 0.0))}",
+        f"- Train mean spike timing F1: "
+        f"{train_aggregate.get('mean_spike_timing_f1', float('nan')):.4f}",
+        f"- Train mean voltage RMSE: "
+        f"{train_aggregate.get('mean_voltage_rmse', float('nan')):.4f}",
+    ]
+    if test_aggregate:
+        lines.extend(
+            [
+                f"- Test sweeps: {int(test_aggregate.get('n_sweeps', 0.0))}",
+                f"- Test mean spike timing F1: "
+                f"{test_aggregate.get('mean_spike_timing_f1', float('nan')):.4f}",
+                f"- Test mean spike count error: "
+                f"{test_aggregate.get('mean_spike_count_error', float('nan')):.4f}",
+                f"- Test mean voltage RMSE: "
+                f"{test_aggregate.get('mean_voltage_rmse', float('nan')):.4f}",
+            ]
+        )
+    if zero_shot_aggregate:
+        zero_shot_count_error = zero_shot_aggregate.get(
+            "mean_spike_count_error",
+            float("nan"),
+        )
+        lines.extend(
+            [
+                "",
+                "## Zero-Shot Evaluation",
+                "",
+                f"- Zero-shot sweeps: {int(zero_shot_aggregate.get('n_sweeps', 0.0))}",
+                f"- Zero-shot mean spike timing F1: "
+                f"{zero_shot_aggregate.get('mean_spike_timing_f1', float('nan')):.4f}",
+                f"- Zero-shot mean spike count error: {zero_shot_count_error:.4f}",
+                f"- Zero-shot mean voltage RMSE: "
+                f"{zero_shot_aggregate.get('mean_voltage_rmse', float('nan')):.4f}",
+            ]
+        )
+    if prefit_summaries:
+        lines.extend(["", "## Prefit Cells", ""])
+        lines.extend(
+            f"- Specimen {summary['specimen_id']}: "
+            f"test spike timing F1={summary['test_spike_timing_f1']:.4f}, "
+            f"test spike count error={summary['test_spike_count_error']:.4f}"
+            for summary in prefit_summaries
+        )
+    if derived_bounds:
+        lines.extend(["", "## Derived Bounds", ""])
+        lines.extend(
+            f"- `{name}`: [{lower:.4f}, {upper:.4f}]"
+            for name, (lower, upper) in sorted(derived_bounds.items())
         )
 
-    final = history[-1]
+    (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    output_dir = Path(args.output_dir)
+
+    cells = query_mouse_visp_l5_pyramidal_cells(manifest_file=args.manifest_file)
+    if not cells:
+        raise RuntimeError("No mouse VISp layer-5 pyramidal candidates were found.")
+    explicit_specimen_ids = (
+        {int(specimen_id) for specimen_id in args.specimen_ids}
+        if args.specimen_ids
+        else None
+    )
+    if explicit_specimen_ids is not None:
+        cells = [
+            cell
+            for cell in cells
+            if int(cell.get("specimen_id") or cell.get("id")) in explicit_specimen_ids
+        ]
+        if not cells:
+            raise RuntimeError(
+                "None of the requested specimen IDs matched the filtered "
+                "mouse VISp layer-5 pyramidal candidates."
+            )
+
+    candidate_payloads = []
+    if explicit_specimen_ids is not None:
+        search_cells = cells
+    else:
+        search_cells = cells[: max(args.max_cells, args.candidate_cells)]
+    from btorch.analysis.two_compartment_fit import get_cell_types_cache
+
+    cache = get_cell_types_cache(args.manifest_file)
+    for cell in search_cells:
+        specimen_id = int(cell.get("specimen_id") or cell.get("id"))
+        sweep_records = cache.get_ephys_sweeps(specimen_id)
+        chosen = choose_current_clamp_sweeps(sweep_records)
+        loaded = [
+            load_allen_sweep(
+                specimen_id=specimen_id,
+                sweep_number=int(sweep["sweep_number"]),
+                dt_ms=args.dt_ms,
+                manifest_file=args.manifest_file,
+                cache=cache,
+                trim_to_stimulus=args.trim_to_stimulus,
+                trim_pre_pad_ms=args.trim_pre_pad_ms,
+                trim_post_pad_ms=args.trim_post_pad_ms,
+                trim_activity_threshold_pa=args.trim_activity_threshold_pa,
+            )
+            for sweep in chosen
+        ]
+        if not loaded:
+            continue
+        candidate_payloads.append((specimen_id, loaded, _cell_richness_score(loaded)))
+
+    candidate_payloads.sort(key=lambda item: item[2], reverse=True)
+    if explicit_specimen_ids is not None:
+        selected_payloads = candidate_payloads[: len(candidate_payloads)]
+    else:
+        selected_payloads = candidate_payloads[: args.max_cells]
+
+    selected_splits = []
+    train_sweeps = []
+    test_sweeps = []
+    for specimen_id, loaded, richness in selected_payloads:
+        selected = _select_representative_sweeps(loaded, args.max_sweeps_per_cell)
+        train_split, test_split = _stratified_split_sweeps(
+            selected,
+            args.test_fraction,
+        )
+        train_split, test_split = _ensure_spiking_coverage(
+            train_split,
+            test_split,
+            selected,
+        )
+        train_split, test_split = _ensure_lowrate_coverage(
+            train_split,
+            test_split,
+            selected,
+        )
+        train_split, test_split = _ensure_sustained_coverage(
+            train_split,
+            test_split,
+            selected,
+        )
+        train_sweeps.extend(train_split)
+        test_sweeps.extend(test_split)
+        selected_splits.append(
+            {
+                "specimen_id": specimen_id,
+                "richness": richness,
+                "train_sweeps": train_split,
+                "test_sweeps": test_split,
+            }
+        )
+        print(
+            "Selected specimen",
+            specimen_id,
+            "richness=",
+            richness,
+            "train=",
+            [sweep.sweep_number for sweep in train_split],
+            "test=",
+            [sweep.sweep_number for sweep in test_split],
+        )
+
+    if not train_sweeps:
+        raise RuntimeError("No suitable current-clamp sweeps were found.")
+
+    prefit_count = args.prefit_cells
+    if prefit_count <= 0 and args.max_cells > 1:
+        prefit_count = len(selected_splits)
+
+    prefit_parameter_sets: list[dict[str, float]] = []
+    prefit_summaries: list[dict] = []
+    for split in selected_splits[:prefit_count]:
+        specimen_id = int(split["specimen_id"])
+        specimen_model = _build_default_model(device)
+        prefit_result = _fit_model_bundle(
+            model=specimen_model,
+            train_sweeps=list(split["train_sweeps"]),
+            test_sweeps=list(split["test_sweeps"]),
+            output_dir=output_dir / "prefit" / f"specimen_{specimen_id}",
+            args=args,
+            method=args.prefit_method,
+            epochs=args.prefit_epochs,
+            global_maxiter=args.prefit_global_maxiter,
+            global_popsize=args.prefit_global_popsize,
+            local_maxiter=args.prefit_local_maxiter,
+        )
+        prefit_parameter_sets.append(prefit_result["parameters"])
+        prefit_summaries.append(
+            {
+                "specimen_id": specimen_id,
+                "test_spike_timing_f1": float(
+                    prefit_result["test_aggregate"].get("mean_spike_timing_f1", 0.0)
+                ),
+                "test_spike_count_error": float(
+                    prefit_result["test_aggregate"].get("mean_spike_count_error", 0.0)
+                ),
+            }
+        )
+
+    derived_bounds = None
+    median_parameters = {}
+    if prefit_parameter_sets:
+        derived_bounds = derive_population_parameter_bounds(
+            prefit_parameter_sets,
+            default_bounds=DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
+            margin_fraction=args.prior_margin_fraction,
+            min_fraction_of_default=args.prior_min_fraction_default,
+        )
+        median_parameters = _median_parameter_set(prefit_parameter_sets)
+
+    model = _build_default_model(device)
+    if median_parameters:
+        load_model_parameters(model, median_parameters)
+    shared_result = _fit_model_bundle(
+        model=model,
+        train_sweeps=train_sweeps,
+        test_sweeps=test_sweeps,
+        output_dir=output_dir,
+        args=args,
+        param_bounds=derived_bounds or DEFAULT_TWO_COMPARTMENT_PARAM_BOUNDS,
+    )
+    zero_shot_aggregate = _evaluate_zero_shot(
+        model=model,
+        candidate_payloads=candidate_payloads,
+        used_specimen_ids={int(item["specimen_id"]) for item in selected_splits},
+        args=args,
+        output_dir=output_dir,
+    )
+    _write_run_summary(
+        output_dir=output_dir,
+        train_aggregate=shared_result["train_aggregate"],
+        test_aggregate=shared_result["test_aggregate"],
+        zero_shot_aggregate=zero_shot_aggregate,
+        derived_bounds=derived_bounds,
+        prefit_summaries=prefit_summaries,
+    )
+
+    final = shared_result["history"][-1]
     print("Finished fitting")
     print(f"  train_sweeps:   {len(train_sweeps)}")
     print(f"  test_sweeps:    {len(test_sweeps)}")
@@ -657,19 +967,26 @@ def main() -> None:
     print(f"  spike_timing:  {final['spike_timing_loss']:.6f}")
     print(f"  sparsity_loss: {final['sparsity_loss']:.6f}")
     print("Train summary")
-    for name, value in train_aggregate.items():
+    for name, value in shared_result["train_aggregate"].items():
         print(f"  {name}: {value:.6f}")
-    if test_aggregate:
+    if shared_result["test_aggregate"]:
         print("Test summary")
-        for name, value in test_aggregate.items():
+        for name, value in shared_result["test_aggregate"].items():
+            print(f"  {name}: {value:.6f}")
+    if zero_shot_aggregate:
+        print("Zero-shot summary")
+        for name, value in zero_shot_aggregate.items():
             print(f"  {name}: {value:.6f}")
     print("Train artifacts")
-    for name, path in train_paths.items():
+    for name, path in shared_result["train_paths"].items():
         print(f"  {name}: {path}")
-    if test_paths:
+    if shared_result["test_paths"]:
         print("Test artifacts")
-        for name, path in test_paths.items():
+        for name, path in shared_result["test_paths"].items():
             print(f"  {name}: {path}")
+    if zero_shot_aggregate:
+        print(f"  zero_shot: {output_dir / 'zero_shot'}")
+    print(f"  summary: {output_dir / 'summary.md'}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,24 @@ from .aggregation import (
 from .branching import branching_ratio
 from .connectivity import HopDistanceModel, compute_ie_ratio
 from .metrics import indices_to_mask, select_on_metric
+from .neuron_model_benchmark import (
+    BenchmarkEvaluation,
+    BenchmarkModelSpec,
+    aggregate_benchmark_evaluations,
+    benchmark_loss,
+    build_benchmark_model,
+    default_benchmark_model_specs,
+    evaluate_benchmark_model_on_sweep,
+    fit_benchmark_model,
+    plot_functional_task_summary,
+    plot_standard_benchmark_summary,
+    rollout_benchmark_model,
+    run_apical_gain_task,
+    run_lag_sensitivity_task,
+    save_benchmark_report,
+    write_benchmark_csv,
+    write_benchmark_summary_markdown,
+)
 from .spiking import (
     compute_raster,
     compute_spectrum,
@@ -73,6 +91,22 @@ __all__ = [
     "compute_ie_ratio",
     "indices_to_mask",
     "select_on_metric",
+    "BenchmarkEvaluation",
+    "BenchmarkModelSpec",
+    "aggregate_benchmark_evaluations",
+    "benchmark_loss",
+    "build_benchmark_model",
+    "default_benchmark_model_specs",
+    "evaluate_benchmark_model_on_sweep",
+    "fit_benchmark_model",
+    "plot_functional_task_summary",
+    "plot_standard_benchmark_summary",
+    "rollout_benchmark_model",
+    "run_apical_gain_task",
+    "run_lag_sensitivity_task",
+    "save_benchmark_report",
+    "write_benchmark_csv",
+    "write_benchmark_summary_markdown",
     # New simplified API
     "isi_cv",
     "fano",
